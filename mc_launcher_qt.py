@@ -19,7 +19,7 @@ mc_launcher_qt.py —— PyQt6 版 Minecraft 启动器 UI
     python mc_launcher_qt.py
 """
 from __future__ import annotations
-
+import subprocess
 import collections
 import json
 import os
@@ -34,8 +34,8 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QIcon, QPixmap, QTextCursor
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
@@ -57,7 +57,7 @@ LOG_BUFFER = collections.deque(maxlen=3000)
 # ---------------------------------------------------------------------------
 # 版本号 / 自动更新
 # ---------------------------------------------------------------------------
-CURRENT_VERSION = "0.0.0"
+CURRENT_VERSION = "1.0.2"
 GITHUB_REPO = "xp12-mcmin/PyMC-Launcher"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_PROXY = \
@@ -105,7 +105,16 @@ def open_url_safe(url: str):
     except Exception as e:
         print(f"[打开网页异常] {e}")
 
-
+def open_browser_as_normal(url):
+    try:
+        # 强制使用资源管理器(普通权限)去拉起浏览器，避开高权限拦截
+        subprocess.Popen(["explorer.exe", url])
+    except Exception as e:
+        print(f"降权打开失败: {e}")
+        # 备用方案：如果 explorer 抽风，退回 QDesktopServices
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl(url))
 def launcher_dir() -> Path:
     """启动器自身所在的目录（兼容 PyInstaller 单文件/单目录两种模式）。
 
@@ -1546,6 +1555,120 @@ class ModManagerDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# 陶瓦联机端口扫描线程
+# ---------------------------------------------------------------------------
+class TerracottaScannerThread(QThread):
+    """后台扫描陶瓦动态端口的工作线程。
+
+    职责：
+      1. 用 subprocess.Popen 启动陶瓦 exe（列表参数 + CREATE_NO_WINDOW 防黑框，
+         并注入 env["BROWSER"]="echo" 拦截陶瓦自身唤起浏览器，避免 Edge 高权限弹窗）。
+      2. 用 psutil 记录启动前本地 LISTEN 端口基线，随后轮询找出新增的、真正
+         在监听的"陌生"端口（陶瓦动态端口）。
+      3. 找到端口发 port_found(int)；陶瓦退出 / 超时 / 启动失败发 scan_failed(str)。
+
+    信号：
+      port_found      -> 扫描到的新端口号
+      scan_failed     -> 失败原因（用于主线程弹 QMessageBox）
+      process_started -> 陶瓦进程 PID（主线程记录，便于退出时清理）
+    """
+    port_found = pyqtSignal(int)
+    scan_failed = pyqtSignal(str)
+    process_started = pyqtSignal(int)
+
+    def __init__(self, exe_path, timeout=60.0, interval=0.3, parent=None):
+        super().__init__(parent)
+        self.exe_path = str(exe_path)
+        self.timeout = timeout
+        self.interval = interval
+        self.proc = None            # 陶瓦 subprocess 句柄
+
+    def _list_local_listen_ports(self) -> set:
+        """返回系统所有本地 TCP LISTEN 端口（去重）的集合。"""
+        try:
+            import psutil
+        except ImportError:
+            raise RuntimeError("缺少依赖 psutil，请先执行 pip install psutil")
+        ports = set()
+        try:
+            conns = psutil.net_connections(kind="tcp")
+        except Exception:
+            conns = []
+        for conn in conns:
+            if conn.status == "LISTEN":
+                try:
+                    ports.add(conn.laddr.port)
+                except Exception:
+                    continue
+        return ports
+
+    def _is_port_usable(self, port: int) -> bool:
+        """端口当前是否可被重新绑定（用于过滤瞬时端口，排除监听口）。"""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+
+    def run(self):
+        # 1) 记录基线端口
+        try:
+            base_ports = self._list_local_listen_ports()
+        except Exception as e:
+            self.scan_failed.emit(f"扫描端口失败：{e}")
+            return
+
+        # 2) 启动陶瓦：拦截它自己唤起浏览器，并用 CREATE_NO_WINDOW 防黑框
+        env = os.environ.copy()
+        env["BROWSER"] = "echo"   # 屏蔽陶瓦(Rust)自动调起浏览器 -> 避免 Edge 高权限弹窗
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            self.proc = subprocess.Popen(
+                [self.exe_path],
+                env=env,
+                creationflags=flags,
+            )
+        except Exception as e:
+            self.scan_failed.emit(f"启动陶瓦失败：{e}")
+            return
+        try:
+            self.process_started.emit(self.proc.pid)
+        except Exception:
+            pass
+
+        # 3) 轮询扫描新增的 LISTEN 端口
+        import time
+        start = time.time()
+        found = None
+        while time.time() - start < self.timeout:
+            if self.isInterruptionRequested():
+                return
+            ret = self.proc.poll()
+            if ret is not None:
+                self.scan_failed.emit(f"陶瓦提前退出，退出码 {ret}")
+                return
+            now = self._list_local_listen_ports()
+            new_ports = now - base_ports
+            candidates = {p for p in new_ports if not self._is_port_usable(p)}
+            if candidates:
+                found = sorted(candidates)[0]
+                break
+            time.sleep(self.interval)
+
+        if found:
+            self.port_found.emit(found)
+        else:
+            self.scan_failed.emit(
+                "等待陶瓦端口超时，未发现新增的本地 LISTEN 端口。")
+
+    def stop(self):
+        """请求线程尽快停止扫描（等下一次轮询跳出）。"""
+        self.requestInterruption()
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -1601,6 +1724,10 @@ class MainWindow(QMainWindow):
         # 【陶瓦联机】Terracotta 进程句柄（仅主线程读写；关闭时用 taskkill 强杀进程树）
         self._terracotta_proc: subprocess.Popen | None = None
         self._terracotta_cache_dir = Path(core.BASE_DIR) / "terracotta"
+        # 【陶瓦联机】端口扫描线程（QThread，后台跑，找到端口发 port_found）
+        self._terracotta_scanner: TerracottaScannerThread | None = None
+        # 【陶瓦联机】已启动的陶瓦进程 PID（用于退出时递归杀进程树）
+        self._terracotta_pid: int | None = None
 
         # 各列表的 行/数据 映射
         self._loader_items = []                    # [(kind, ver, url), ...]
@@ -1940,6 +2067,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_resource_tab(), "Mod资源")
         self.tabs.addTab(self._build_modpack_tab(), "整合包")
         # self.tabs.addTab(self._build_server_tab(), "开服工具")  # [已切除] 开服工具不再展示
+        self.tabs.addTab(self._build_terracotta_tab(), "陶瓦联机")
         self.tabs.addTab(self._build_settings_tab(), "设置")
         root.addWidget(self.tabs, 1)
         # 切到「Mod资源」或「整合包」页签时，若该页从未搜过，
@@ -1955,6 +2083,104 @@ class MainWindow(QMainWindow):
         # 全局 Java / 目录 / 内存 已抽到【设置】页签，底部只留状态栏
         # 状态框 stretch=0 + Fixed 高度策略：始终贴底、紧凑，不被上方 tab 内容拉高
         root.addWidget(self._build_status_box(), 0)
+
+    # ------------- 陶瓦联机管理页签 -------------
+    def _build_terracotta_tab(self) -> QWidget:
+        """独立的「陶瓦联机管理」页面。
+
+        包含：状态指示灯/标签、[启动联机]/[结束联机] 两个联动按钮、
+        一个只读日志框（实时显示陶瓦启动/控制台信息）。
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        # ---- 状态区 ----
+        box = QGroupBox("联机状态")
+        bf = QFormLayout(box)
+        bf.setContentsMargins(10, 10, 10, 10)
+        bf.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.terra_status_label = QLabel("未启动")
+        self.terra_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.terra_status_label.setStyleSheet(
+            "font-size: 12pt; font-weight: bold; color: #999999;")
+        bf.addRow("状态", self.terra_status_label)
+        lay.addWidget(box)
+
+        # ---- 操作按钮区 ----
+        btn_box = QGroupBox("操作")
+        bb = QHBoxLayout(btn_box)
+        bb.setContentsMargins(10, 10, 10, 10)
+        self.btn_terra_start = self._mk_button("🚀 启动联机", self._start_terracotta,
+                                               primary=True)
+        self.btn_terra_stop = self._mk_button("🛑 结束联机", self._stop_terracotta)
+        self.btn_terra_stop.setEnabled(False)   # 初始未启动，禁止结束
+        bb.addWidget(self.btn_terra_start)
+        bb.addWidget(self.btn_terra_stop)
+        bb.addStretch(1)
+        lay.addWidget(btn_box)
+
+        # ---- 日志输出区 ----
+        log_box = QGroupBox("陶瓦联机日志")
+        lb = QVBoxLayout(log_box)
+        lb.setContentsMargins(10, 10, 10, 10)
+        self.terra_log = QPlainTextEdit()
+        self.terra_log.setReadOnly(True)
+        self.terra_log.setMaximumBlockCount(2000)
+        self.terra_log.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 9pt;")
+        self.terra_log.setPlaceholderText("陶瓦联机控制台输出将显示在这里...")
+        lb.addWidget(self.terra_log, 1)
+        lay.addWidget(log_box, 1)
+
+        return w
+
+    def _set_terracotta_state(self, state: str, port: int | None = None):
+        """【主线程】统一刷新陶瓦联机页面的状态标签与按钮联动。
+
+        state 取值：unstarted / starting / ready / stopped
+        """
+        color = {
+            "unstarted": "#999999",   # 灰
+            "starting": "#ffaa00",    # 橙
+            "ready": "#33cc33",       # 绿
+            "stopped": "#888888",     # 深灰
+        }.get(state, "#999999")
+        if state == "unstarted":
+            text = "未启动"
+        elif state == "starting":
+            text = "启动中..."
+        elif state == "ready":
+            text = f"联机就绪 (后台运行中)"
+        elif state == "stopped":
+            text = "已停止"
+        else:
+            text = state
+        self.terra_status_label.setText(text)
+        self.terra_status_label.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; color: {color};")
+        # 按钮联动：启动中/就绪时禁用「启动」，启用「结束」；否则反之
+        running = state in ("starting", "ready")
+        self.btn_terra_start.setEnabled(not running)
+        self.btn_terra_stop.setEnabled(running)
+
+    def _terra_append_log(self, line: str):
+        """【主线程】往陶瓦日志框追加一行（带时间戳）。"""
+        if getattr(self, "terra_log", None) is None:
+            return
+        ts = time.strftime("%H:%M:%S")
+        self.terra_log.appendPlainText(f"[{ts}] {line}")
+
+    def _stop_terracotta(self):
+        """【主线程】结束陶瓦联机：psutil 递归杀进程树，状态置「已停止」。"""
+        self.bridge.log.emit("正在结束陶瓦联机...")
+        self._terra_append_log("正在结束陶瓦联机...")
+        self._kill_terracotta()
+        self._set_terracotta_state("stopped")
+        self.bridge.status.emit("陶瓦联机已停止")
+        self.bridge.log.emit("陶瓦联机已停止")
 
     # ------------- 顶部：账号与设置 -------------
     def _build_account_box(self) -> QGroupBox:
@@ -2776,13 +3002,11 @@ class MainWindow(QMainWindow):
         sysf.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         # -- 陶瓦联机（P2P）--
-        # -- 陶瓦联机（P2P）--
-        self.btn_terracotta = self._mk_button("🌐 陶瓦联机 (P2P)", self._start_terracotta)
-        sysf.addRow(self.btn_terracotta)
-        
         terra_hint = QLabel("基于开源项目 Terracotta 提供 P2P 穿透，房主退出即断开，严禁商业开服")
         terra_hint.setWordWrap(True)
         sysf.addRow(terra_hint)
+        self.btn_terracotta = self._mk_button("🌐 陶瓦联机 (P2P)", self._start_terracotta)
+        sysf.addRow(self.btn_terracotta)
         # -- 一键清理垃圾 --
         clean_hint = QLabel("扫描 versions/*/logs、crash-reports 及 installer_tmp 的垃圾文件并清理")
         clean_hint.setWordWrap(True)
@@ -7551,25 +7775,103 @@ class MainWindow(QMainWindow):
     # 陶瓦联机（Terracotta，P2P）
     # ==================================================================
     def _start_terracotta(self):
-        """按钮入口：点击「🌐 陶瓦联机 (P2P)」走免责确认 + 下载/拉起流程。"""
+        """按钮入口：点击「🌐 陶瓦联机 (P2P)」走免责确认 + 启动扫描线程。"""
         self._on_terracotta_clicked()
 
+    def _on_scanner_process_started(self, pid: int):
+        """【主线程槽】陶瓦进程已启动：状态置「启动中...」，记录 PID。"""
+        self._terracotta_pid = pid
+        self._set_terracotta_state("starting")
+        self._terra_append_log(f"陶瓦联机进程已启动（PID {pid}），正在扫描端口...")
+        self.bridge.log.emit(f"陶瓦联机进程已启动（PID {pid}），正在扫描端口...")
+        self.bridge.status.emit("正在扫描陶瓦联机端口...")
+
+    def _on_scanner_port_found(self, port: int):
+        """【主线程槽】扫描到陶瓦端口：状态置「联机就绪」，弹提示并拉起浏览器。"""
+        url = f"http://127.0.0.1:{port}/"
+        self._set_terracotta_state("ready", port)
+        self._terra_append_log(f"陶瓦联机端口就绪：{url}")
+        self.bridge.log.emit(f"陶瓦联机端口就绪：{url}")
+        self.bridge.status.emit(f"陶瓦联机就绪 (端口: {port})")
+        
+        # 主线程主动打开浏览器：对系统来说是本 Python 进程发起的普通请求
+        QMessageBox.information(
+            self, "陶瓦联机就绪",
+            f"✅ 联机已就绪！\n\n地址：{url}\n\n将为您打开联机页面。")
+        
+        try:
+            import subprocess
+            # 1. 先干掉可能残留的高权限 Edge 实例（防止它拦截新实例）
+            # 使用 CREATE_NO_WINDOW 防止闪黑框
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.Popen("taskkill /f /im msedge.exe", shell=True, 
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                             startupinfo=startupinfo)
+            
+            # 2. 使用 explorer.exe 强制降权拉起网页（避开 UAC 拦截）
+            subprocess.Popen(["explorer.exe", url])
+            
+        except Exception as exc:
+            self.bridge.log.emit(f"降权打开联机页面失败：{exc}，尝试备用方案...")
+            # 备用方案：如果 explorer 抽风，退回 QDesktopServices
+            try:
+                QDesktopServices.openUrl(QUrl(url))
+            except Exception as e2:
+                self.bridge.log.emit(f"备用方案也失败了：{e2}")
+
+    def _on_scanner_failed(self, reason: str):
+        """【主线程槽】扫描/启动失败：状态置「已停止」，弹窗提示。"""
+        self.bridge.log.emit(f"陶瓦联机失败：{reason}")
+        self.bridge.status.emit("陶瓦联机失败")
+        self._terra_append_log(f"陶瓦联机失败：{reason}")
+        QMessageBox.critical(self, "陶瓦联机失败", reason)
+        # 顺手清理可能的进程
+        self._kill_terracotta()
+        self._set_terracotta_state("stopped")
+
     def _on_terracotta_clicked(self):
-        """【UI 主线程】点击「🌐 陶瓦联机」：免责确认 -> 后台线程下载/拉起。"""
-        ret = QMessageBox.question(
-            self, "陶瓦联机（P2P）",
-            "本联机基于开源项目 Terracotta 提供 P2P 穿透，"
-            "房主退出即断开。严禁用于商业开服。\n\n是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if ret != QMessageBox.StandardButton.Yes:
+        """【主线程】点击启动：直接拉起辅助器。"""
+        if getattr(self, "_terra_helper_proc", None) is not None:
+            QMessageBox.information(self, "提示", "陶瓦联机辅助进程已在运行中。")
             return
-        # 是否已在运行
-        if self._terracotta_is_alive():
-            QMessageBox.information(self, "陶瓦联机", "陶瓦联机已在运行中。")
-            return
-        # 耗时操作（下载）一律进后台线程，UI 操作全在主线程
-        run_bg(self._terracotta_worker)
+
+        if getattr(sys, "frozen", False):
+            base_dir = Path(os.path.dirname(sys.executable))
+        else:
+            base_dir = launcher_dir()
+
+        # 👇 这里的文件名必须和你打包出来的 exe 名字一模一样！
+        helper_exe = base_dir / "PyMC_TerracottaLauncher.exe"
+        
+        if not helper_exe.exists():
+            # 兼容开发环境（直接跑 py 脚本）
+            helper_py = base_dir / "terracotta_port_scan.py"
+            if not helper_py.exists():
+                QMessageBox.warning(self, "错误", f"未找到辅助程序：\n{helper_exe.name}")
+                return
+            cmd = [sys.executable, str(helper_py)]
+        else:
+            cmd = [str(helper_exe)]
+
+        self._set_terracotta_state("starting")
+        self._terra_append_log("正在拉起底层联机核心...")
+        self._terra_append_log("⚠️ 请注意：即将弹出“用户账户控制(UAC)”，请点击“是”以授权联机。")
+
+        try:
+            import subprocess
+            # 直接用 start 命令拉起带 UAC 清单的程序，完美绕开 WinError 740
+            # 第一个空字符串 "" 是窗口标题，防止路径带空格被错认
+            cmd = f'start "" "{helper_exe}"'
+            subprocess.Popen(cmd, shell=True, cwd=str(base_dir))
+            
+            self._set_terracotta_state("ready")
+            self.bridge.status.emit("陶瓦联机已启动 (等待授权并后台探测中)")
+        except Exception as exc:
+            self._set_terracotta_state("stopped")
+            QMessageBox.critical(self, "启动失败", f"无法启动辅助进程：\n{exc}")
+
+
 
     def _terracotta_is_alive(self) -> bool:
         """Terracotta 进程是否仍存活（只读，主线程调用）。"""
@@ -7657,29 +7959,47 @@ class MainWindow(QMainWindow):
         self.bridge.status.emit("陶瓦联机已启动")
         self.bridge.info.emit("陶瓦联机",
                               "陶瓦联机已启动，请在弹出的窗口进行联机操作。")
-
+        
     def _kill_terracotta(self):
-        """【主线程】taskkill /T 强杀整个 Terracotta 进程树，绝不留孤儿进程。"""
-        proc = self._terracotta_proc
-        if proc is None:
-            return
-        pid = None
+        """【主线程】纯 ctypes 内核级强杀，彻底告别残留。"""
+        import psutil
+        import ctypes
+
+        target_pids = set()
         try:
-            pid = proc.pid
-            if proc.poll() is not None:
-                # 进程已退出，无需清理
-                self._terracotta_proc = None
-                return
+            for proc in psutil.process_iter(['pid', 'name']):
+                pname = proc.info['name']
+                if pname and ("terracotta" in pname.lower() or "terra" in pname.lower()):
+                    target_pids.add(proc.info['pid'])
         except Exception:
-            self._terracotta_proc = None
+            pass
+
+        if not target_pids:
+            self._terra_append_log("未发现存活的陶瓦/辅助器进程。")
+            self._terra_helper_proc = None
+            self._set_terracotta_state("stopped")
             return
-        try:
-            # /T：连同子进程树一起结束；/F：强制结束
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=10)
-        except Exception as exc:
-            print(f"[陶瓦联机] 强杀进程树失败 PID={pid}: {exc}", flush=True)
-        self._terracotta_proc = None
+
+        self._terra_append_log(f"检测到残留进程 PID: {target_pids}，执行内核级清理...")
+
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_TERMINATE = 1
+
+        for pid in target_pids:
+            h_process = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h_process:
+                success = kernel32.TerminateProcess(h_process, 1)
+                kernel32.CloseHandle(h_process)
+                if success:
+                    self._terra_append_log(f"✅ 成功强杀 PID: {pid}")
+                else:
+                    self._terra_append_log(f"❌ 强杀 PID: {pid} 失败")
+            else:
+                self._terra_append_log(f"❌ 无法获取 PID: {pid} 的句柄")
+
+        self._terra_helper_proc = None
+        self._set_terracotta_state("stopped")
+        self.bridge.status.emit("陶瓦联机已停止")
 
 
 # ---------------------------------------------------------------------------
